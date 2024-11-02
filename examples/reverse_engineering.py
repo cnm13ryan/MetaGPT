@@ -64,7 +64,8 @@ async def reverse_engineering(package_root: Path, output_dir: Path):
     action = RebuildClassView(name="ReverseEngineering", i_context=str(package_root), llm=LLM(), context=ctx)
     await action.run()
 
-    action = RebuildSequenceView(name="ReverseEngineering", llm=LLM(), context=ctx)
+    # Pass `i_context=str(package_root)` to RebuildSequenceView
+    action = RebuildSequenceView(name="ReverseEngineering", i_context=str(package_root), llm=LLM(), context=ctx)
     await action.run()
 
 

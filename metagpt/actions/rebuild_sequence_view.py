@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -92,6 +93,10 @@ class RebuildSequenceView(Action):
             with_messages (Optional[Type]): An optional argument specifying messages to react to.
             format (str): The format for the prompt schema.
         """
+        if not self.i_context:
+            self.i_context = self.context.git_repo.workdir  # Set to the target project's root directory
+        logger.debug(f"self.i_context set to: {self.i_context}")
+
         graph_repo_pathname = self.context.git_repo.workdir / GRAPH_REPO_FILE_REPO / self.context.git_repo.workdir.name
         self.graph_db = await DiGraphRepository.load_from(str(graph_repo_pathname.with_suffix(".json")))
         if not self.i_context:
@@ -123,6 +128,12 @@ class RebuildSequenceView(Action):
         prefix = filename + ":"
         for r in rows:
             if prefix in r.subject:
+                # Extract the base name of the subject
+                subject_basename = os.path.basename(split_namespace(r.subject)[-1])
+                # Skip if the subject is 'src' or a directory
+                if subject_basename == 'src':
+                    logger.warning(f"Skipping invalid class name: {r.subject}")
+                    continue
                 classes.append(r)
                 await self._rebuild_use_case(r.subject)
         participants = await self._search_participants(split_namespace(entry.subject)[0])
@@ -244,15 +255,6 @@ class RebuildSequenceView(Action):
         class_view = await self._get_uml_class_view(ns_class_name)
         source_code = await self._get_source_code(ns_class_name)
 
-        # prompt_blocks = [
-        #     "## Instruction\n"
-        #     "You are a python code to UML 2.0 Use Case translator.\n"
-        #     'The generated UML 2.0 Use Case must include the roles or entities listed in "Participants".\n'
-        #     "The functional descriptions of Actors and Use Cases in the generated UML 2.0 Use Case must not "
-        #     'conflict with the information in "Mermaid Class Views".\n'
-        #     'The section under `if __name__ == "__main__":` of "Source Code" contains information about external '
-        #     "system interactions with the internal system.\n"
-        # ]
         prompt_blocks = []
         block = "## Participants\n"
         for p in participants:
@@ -437,17 +439,35 @@ class RebuildSequenceView(Action):
         Returns:
             str: A string containing the source code of the specified namespace-prefixed class.
         """
+        logger.debug(f"ns_class_name: {ns_class_name}")
         rows = await self.graph_db.select(subject=ns_class_name, predicate=GraphKeyword.HAS_PAGE_INFO)
         filename = split_namespace(ns_class_name=ns_class_name)[0]
+        logger.debug(f"Filename after split_namespace: {filename}")
+
+        # Check if filename is 'src' and handle accordingly
+        if filename == 'src':
+            logger.error(f"Invalid filename 'src' detected for ns_class_name: {ns_class_name}")
+            raise ValueError(f"Invalid class name: {ns_class_name}")
+
         if not rows:
-            src_filename = RebuildSequenceView._get_full_filename(root=self.i_context, pathname=filename)
+            src_filename = self._get_full_filename(root=self.i_context, pathname=filename)
+            logger.debug(f"src_filename from _get_full_filename: {src_filename}")
             if not src_filename:
-                return ""
-            return await aread(filename=src_filename, encoding="utf-8")
-        code_block_info = CodeBlockInfo.model_validate_json(rows[0].object_)
-        return await read_file_block(
-            filename=filename, lineno=code_block_info.lineno, end_lineno=code_block_info.end_lineno
-        )
+                logger.error(f"Source file not found for ns_class_name: {ns_class_name}")
+                raise FileNotFoundError(f"Source file not found for ns_class_name: {ns_class_name}")
+            if Path(src_filename).is_dir():
+                logger.error(f"Expected a file but found a directory: {src_filename}")
+                raise IsADirectoryError(f"Expected a file but found a directory: {src_filename}")
+            content = await aread(filename=src_filename, encoding="utf-8")
+            logger.debug(f"Content length from aread: {len(content)}")
+            return content
+        else:
+            code_block_info = CodeBlockInfo.model_validate_json(rows[0].object_)
+            content = await read_file_block(
+                filename=filename, lineno=code_block_info.lineno, end_lineno=code_block_info.end_lineno
+            )
+            logger.debug(f"Content length from read_file_block: {len(content)}")
+            return content
 
     @staticmethod
     def _get_full_filename(root: str | Path, pathname: str | Path) -> Path | None:
@@ -455,24 +475,66 @@ class RebuildSequenceView(Action):
         Convert package name to the full path of the module.
 
         Args:
-            root (Union[str, Path]): The root path or string representing the package.
-            pathname (Union[str, Path]): The pathname or string representing the module.
+            root (Union[str, Path]): The root path or string representing the project root directory.
+            pathname (Union[str, Path]): The module path or string representing the module or class name.
 
         Returns:
-            Union[Path, None]: The full path of the module, or None if the path cannot be determined.
+            Optional[Path]: The full path of the module, or None if the path cannot be determined.
 
         Examples:
-            If `root`(workdir) is "/User/xxx/github/MetaGPT/metagpt", and the `pathname` is
-            "metagpt/management/skill_manager.py", then the returned value will be
+            If `root` is "/User/xxx/github/MetaGPT", and the `pathname` is
+            "metagpt/management/skill_manager", then the function will attempt to find
             "/User/xxx/github/MetaGPT/metagpt/management/skill_manager.py"
         """
-        if re.match(r"^/.+", pathname):
-            return pathname
-        files = list_files(root=root)
-        postfix = "/" + str(pathname)
-        for i in files:
-            if str(i).endswith(postfix):
-                return i
+        root = Path(root).resolve()
+        logger.debug(f"Root: {root}, Pathname: {pathname}")
+
+        # If pathname is an absolute path and exists, return it directly
+        pathname = Path(pathname)
+        if pathname.is_absolute():
+            logger.debug("Pathname is an absolute path.")
+            if pathname.exists():
+                logger.debug(f"Absolute path exists: {pathname}")
+                return pathname
+            else:
+                logger.error(f"Absolute path does not exist: {pathname}")
+                return None
+
+        # Convert module path to possible file path
+        possible_paths = []
+
+        # Replace dots with os separator for module paths (e.g., a.b.c -> a/b/c.py)
+        module_path = Path(*pathname.parts)
+        possible_paths.append(root / module_path.with_suffix('.py'))
+
+        # If the pathname uses dots instead of slashes
+        if '.' in str(pathname):
+            dotted_path = Path(*str(pathname).split('.')).with_suffix('.py')
+            possible_paths.append(root / dotted_path)
+
+        # Try adding '__init__.py' for packages
+        possible_paths.append(root / module_path / '__init__.py')
+        if '.' in str(pathname):
+            possible_paths.append(root / dotted_path / '__init__.py')
+
+        # Search through possible paths
+        for path in possible_paths:
+            logger.debug(f"Checking possible path: {path}")
+            if path.exists():
+                logger.debug(f"Found file at: {path}")
+                return path
+
+        # If direct paths fail, recursively search for matching filenames
+        filename = pathname.name + '.py'
+        logger.debug(f"Searching for file named: {filename}")
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            if filename in filenames:
+                found_path = Path(dirpath) / filename
+                logger.debug(f"Found file during recursive search: {found_path}")
+                return found_path
+
+        logger.error(f"No matching file found for pathname: {pathname}")
         return None
 
     @staticmethod
@@ -609,5 +671,9 @@ class RebuildSequenceView(Action):
             reasons: List
 
         json_blocks = parse_json_code_block(rsp)
+        if not json_blocks:
+            logger.error("Failed to parse JSON code block from LLM response.")
+            raise ValueError("Invalid LLM response. Expected JSON code block.")
+
         data = _Data.model_validate_json(json_blocks[0])
         return set(data.class_names)
